@@ -71,7 +71,6 @@ function startGame(gameOptions, seed, apId) {
   console.log("Starting game!");
   window.highScore = 0;
   window.lastCorrectSent = 0;
-  window.deathlinksInProgress = false;
   window.game = new Game(gameOptions, seed, apId);
 
   // Disable the standard right-click context menu on the whole document
