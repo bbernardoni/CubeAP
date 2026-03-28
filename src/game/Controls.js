@@ -3,6 +3,7 @@ import Easing from "../animation/Easing.js";
 import Tween from "../animation/Tween.js";
 
 import Move from "./Move.js";
+import RotateMove from "./RotateMove.js";
 import GAME_STATE from "./GameState.js";
 
 const AnimationState = {
@@ -72,13 +73,15 @@ export default class Controls {
 
   //AP
   queueAction(action){
-    this.moveInProgress = this.moveInProgress.then(() => {
-      return new Promise(action);
-    });
+    this.moveInProgress = this.moveInProgress
+      .catch(() => {})
+      .then(() => new Promise(action));
+
+    return this.moveInProgress;
   }
 
   undo_action(){
-    if (!this.enabled || this.scramble !== null || this.deathlinksInProgress > 0) return;
+    if (!this.enabled || this.scramble !== null || this.deathlinksInProgress > 0 || this.state == AnimationState.ANIMATING) return;
     this.queueAction((resolve) => {
       const lastMove = this.game.moveStack.pop();
       if (!lastMove) {
@@ -86,16 +89,28 @@ export default class Controls {
         return;
       }
       this.state = AnimationState.ANIMATING;
-      const moveToApply = lastMove.inverse();
-      this.flipAxis = moveToApply.axis;
-      this.selectLayer(moveToApply.layer);
-      this.rotateLayer(moveToApply.angle, false, false, () => {
-        // Do NOT add the move to the move stack - we're undoing it!
-        this.game.storage.saveGame();
-        this.state = AnimationState.STILL;
-        this.checkIsSolved();
-        resolve();
-      });
+      
+      if(lastMove instanceof RotateMove){
+        const moveToApply = lastMove.inverse();
+        this.flipAxis = moveToApply.axis;
+        this.rotateCube(moveToApply.angle, () => {
+          this.state = AnimationState.STILL;
+          this.game.storage.saveGame();
+          resolve();
+        });
+      }
+      if(lastMove instanceof Move){
+        const moveToApply = lastMove.inverse();
+        this.flipAxis = moveToApply.axis;
+        this.selectLayer(moveToApply.layer);
+        this.rotateLayer(moveToApply.angle, false, false, () => {
+          // Do NOT add the move to the move stack - we're undoing it!
+          this.game.storage.saveGame();
+          this.state = AnimationState.STILL;
+          this.checkIsSolved();
+          resolve();
+        });
+      }
     });
   }
 
@@ -112,6 +127,15 @@ export default class Controls {
       const globalPosition = move.position.clone().applyQuaternion(inverseQuaternion);
 
       const layer = this.getLayer(globalPosition);
+
+      if( this.flipLayer != null) {
+        this.state = AnimationState.STILL;
+        console.log("Already flipping, cannot rotate the cube", this.flipLayer);
+        resolve();
+        return;
+      }else{
+        console.log("OK")
+      }
 
       // Set the axis to rotate
       this.flipAxis = new THREE.Vector3();
@@ -139,9 +163,18 @@ export default class Controls {
       this.state = AnimationState.ANIMATING;
       let axis = face;
       let angle = -Math.PI / 2 * ( ( modifier == "'" ) ? - 1 : 1 );
+
+      if( this.flipLayer != null) {
+        this.state = AnimationState.STILL;
+        console.log("Already flipping, cannot rotate the cube", this.flipLayer, "tried to rotate around", axis);
+        resolve();
+        return;
+      }
+      
       this.flipAxis = new THREE.Vector3();
       this.flipAxis[axis] = 1;
       this.rotateCube(angle, () => {
+        this.game.moveStack.push(new RotateMove(this.flipAxis.clone(), angle));
         this.state = AnimationState.STILL;
         this.game.storage.saveGame();
         resolve();
@@ -296,7 +329,7 @@ export default class Controls {
     this.draggable.onDragStart = position => {
 
       if ( this.scramble !== null ) return;
-      if ( this.state === AnimationState.PREPARING || this.state === AnimationState.ROTATING || this.deathlinksInProgress > 0 ) return;
+      if ( this.state === AnimationState.PREPARING || this.state === AnimationState.ROTATING || this.deathlinksInProgress > 0 || this.state === AnimationState.ANIMATING ) return;
 
       this.gettingDrag = this.state === AnimationState.ANIMATING;
 
@@ -420,7 +453,9 @@ export default class Controls {
 
         this.gettingDrag = false;
         this.state = AnimationState.STILL;
-        this.dragResolve();
+        if (this.dragResolve) {
+          this.dragResolve();
+        }
         return;
 
       }
@@ -451,18 +486,22 @@ export default class Controls {
           this.gettingDrag = false;
 
           this.checkIsSolved();
-          this.dragResolve();
+          if (this.dragResolve) {
+            this.dragResolve();
+          }
 
         } );
 
       } else {
 
         this.rotateCube( delta, () => {
-
+          this.game.moveStack.push(new RotateMove(this.flipAxis.clone(), angle));
           this.state = this.gettingDrag ? AnimationState.PREPARING : AnimationState.STILL;
           this.gettingDrag = false;
           this.game.storage.saveGame();
-          this.dragResolve();
+          if (this.dragResolve) {
+            this.dragResolve();
+          }
         } );
 
       }
@@ -478,45 +517,48 @@ export default class Controls {
    * @param {boolean} isKeyboardEvent - True if the rotation was triggered by a keyboard input
    * @param {onRotateCompleteCallback} callback - Callback to call once the animation is complete.
    */
-  rotateLayer( rotation, scramble, isKeyboardEvent, callback ) {
+  rotateLayer(rotation, scramble, isKeyboardEvent, callback) {
+
+    const layerSnapshot = this.flipLayer ? this.flipLayer.slice() : null;
+
     const config = scramble ? 0 : this.flipConfig;
+    const easing = this.flipEasings[config];
+    const duration = isKeyboardEvent ? this.flipSpeeds[config] / 3 : this.flipSpeeds[config];
+    const bounce = (config == 2) ? this.bounceCube() : (() => {});
 
-    const easing = this.flipEasings[ config ];
-    const duration = isKeyboardEvent ? this.flipSpeeds[ config ] / 3 : this.flipSpeeds[ config ];
-    const bounce = ( config == 2 ) ? this.bounceCube() : ( () => {} );
+    this.rotationTween = new Tween({
 
-    this.rotationTween = new Tween( {
-      easing: easing,
-      duration: duration,
+      easing,
+      duration,
+
       onUpdate: tween => {
-
-        let deltaAngle = tween.delta * rotation;
-        this.group.rotateOnAxis( this.flipAxis, deltaAngle );
-        bounce( tween.value, deltaAngle, rotation );
-
+        const deltaAngle = tween.delta * rotation;
+        this.group.rotateOnAxis(this.flipAxis, deltaAngle);
+        bounce(tween.value, deltaAngle, rotation);
       },
-      /**
-       * @callback onRotateCompleteCallback
-       * @param {number[]} layer
-       * @returns {void}
-       */
+
       onComplete: () => {
-        if ( ! scramble ) this.onMove();
 
-        if(this.flipLayer){
-          const layer = this.flipLayer.slice( 0 );
+        if (!scramble) this.onMove();
 
-          if(layer){
-            this.game.cube.object.rotation.setFromVector3( this.snapRotation( this.game.cube.object.rotation.toVector3() ) );
-            this.group.rotation.setFromVector3( this.snapRotation( this.group.rotation.toVector3() ) );
-            this.deselectLayer( this.flipLayer );
+        if (layerSnapshot) {
 
-            callback( layer );
-          }
+          this.game.cube.object.rotation.setFromVector3(
+            this.snapRotation(this.game.cube.object.rotation.toVector3())
+          );
+
+          this.group.rotation.setFromVector3(
+            this.snapRotation(this.group.rotation.toVector3())
+          );
+
+          this.deselectLayer(layerSnapshot);
         }
 
-      },
-    } );
+        callback(layerSnapshot);
+
+      }
+
+    });
 
   }
 
